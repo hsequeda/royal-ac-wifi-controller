@@ -433,3 +433,5 @@ uint8_t encode_temp(uint8_t temp) {
     (diff & 0b0100) >> 1 |
     (diff & 0b1000) >> 3;
 }
+
+void calculate_checksum() {}
