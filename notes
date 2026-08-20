@@ -1,0 +1,25 @@
+I think I need to start to sort this thing, it's going out of my hands
+
+so, user will press buttons from his pc, cellphone, etc
+user also need to read current state of AC
+
+I need to add tests to it
+
+
+I need see how can it be persisted
+
+because if the device get off and then start... what should happen???
+
+list of codes
+
+Power Off:  C4 D3 64 80 00 04 C0 F0 42 C0 00 00 01 30
+Power On: C4 D3 64 80 00 24 C0 F0 42 C0 00 00 01 08
+
+Swing Off: C4 D3 64 80 00 24 C0 F0 40 C0 00 00 01 0B
+Swing On: C4 D3 64 80 00 24 C0 F0 5C C0 00 00 01 10
+
+Fan Auto: C4 D3 64 80 00 24 C0 F0 00 C0 00 00 01 73
+Fan Low: C4 D3 64 80 00 24 C0 F0 40 C0 00 00 01 0B
+Fan Middle: C4 D3 64 80 00 24 C0 F0 C0 C0 00 00 01 8B
+Fan High: C4 D3 64 80 00 24 C0 F0 A0 C0 00 00 01 CB
+
