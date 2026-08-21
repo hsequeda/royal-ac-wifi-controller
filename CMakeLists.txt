@@ -17,13 +17,24 @@ FetchContent_MakeAvailable(googletest)
 enable_testing()
 
 add_executable(
-  my_test
-  test/test.cc
+  ac_tests
+  test/ac_state_test.cc
+  src/utils.cpp
+  test/utils_test.cc
+  src/ac_state.cpp
 )
+
+target_include_directories(
+    ac_tests
+    PRIVATE
+    ${CMAKE_SOURCE_DIR}/src
+
+)
+
 target_link_libraries(
-  my_test
+  ac_tests
   GTest::gtest_main
 )
 
 include(GoogleTest)
-gtest_discover_tests(my_test)
+gtest_discover_tests(ac_tests)
