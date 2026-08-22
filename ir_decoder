@@ -1,0 +1,166 @@
+
+void handle_ac_signal() {
+
+  // Wait for LOW header
+  if (digitalRead(IR_PIN) != LOW) {
+    return;
+  }
+
+  // ==============================
+  // HEADER LOW
+  // ==============================
+
+  unsigned long lowTime = readPulse(LOW);
+
+  if (lowTime < 2500 || lowTime > 4000) {
+    return;
+  }
+
+
+  // ==============================
+  // HEADER HIGH
+  // ==============================
+
+  unsigned long highTime = readPulse(HIGH);
+
+  if (highTime < 1400 || highTime > 1700) {
+    return;
+  }
+
+
+  // ==============================
+  // 112 bits = 14 bytes
+  // ==============================
+
+  uint8_t code[14] = {0};
+
+
+  for (int i = 0; i < 112; i++) {
+
+    // Ewery bit starts with LOW
+    unsigned long bitLow = readPulse(LOW);
+
+    if (bitLow < 400 || bitLow > 700) {
+      return;
+    }
+
+
+    // HIGH determines 0 or 1
+    unsigned long bitHigh = readPulse(HIGH);
+
+    if (bitHigh == 0) {
+      return;
+    }
+
+
+    // Which byte are we currently filling?
+    int byteIndex = i / 8;
+
+
+    // Shift current byte
+    code[byteIndex] <<= 1;
+
+
+    // Based on your captured signal:
+    //
+    // HIGH short ≈ 150 - 350 us
+    // HIGH long  ≈ 1030 - 1080 us
+    //
+    // 700 us gives us plenty of separation
+
+    if (bitHigh > 700) {
+      code[byteIndex] |= 1;
+    }
+  }
+
+
+  // ==============================
+  // MESSAGE RECEIVED
+  // ==============================
+
+  consolePrintln("");
+  consolePrintln("===== AC MESSAGE =====");
+
+  consolePrint("HEX: ");
+
+  for (int i = 0; i < 14; i++) {
+
+    consolePrintHexByte(code[i]);
+
+    consolePrint(" ");
+  }
+
+  consolePrintln("");
+  consolePrintln("======================");
+}
+
+
+void mark(uint32_t duration_us) {
+    uint32_t start = micros();
+
+    while (micros() - start < duration_us) {
+        digitalWrite(EMISOR_PIN, HIGH);
+        delayMicroseconds(13);
+
+        digitalWrite(EMISOR_PIN, LOW);
+        delayMicroseconds(13);
+    }
+}
+
+void space(uint32_t duration_us) {
+    digitalWrite(EMISOR_PIN, LOW);
+    delayMicroseconds(duration_us);
+}
+
+unsigned long readPulse(
+  int level,
+  unsigned long timeout = 30000
+) {
+  unsigned long start = micros();
+  while (digitalRead(IR_PIN) == level) {
+
+    if (micros() - start > timeout) {
+      return 0;
+    }
+  }
+
+  return micros() - start;
+}
+
+
+// ================================
+// OUTPUT: SERIAL + TELNET
+// ================================
+
+void consolePrint(const char* text) {
+  Serial.print(text);
+
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.print(text);
+  }
+}
+
+void consolePrintln(const char* text) {
+  Serial.println(text);
+
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.println(text);
+  }
+}
+
+void consolePrintHexByte(uint8_t value) {
+
+  if (value < 0x10) {
+    Serial.print("0");
+
+    if (telnetClient && telnetClient.connected()) {
+      telnetClient.print("0");
+    }
+  }
+
+  Serial.print(value, HEX);
+
+  if (telnetClient && telnetClient.connected()) {
+    telnetClient.print(value, HEX);
+  }
+}
