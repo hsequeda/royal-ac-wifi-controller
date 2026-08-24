@@ -1,21 +1,31 @@
 #include <WiFi.h>
 #include <WebServer.h>
 #include <ArduinoJson.h>
+#include <Wire.h>
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
 #include "src/ac_state.h"
 #include "src/secret.h"
 
 #define EMISOR_PIN 26
+#define THERM_PIN 35
 
-// ================================
-// WIFI
-// ================================
 
+const float SERIES_RESISTOR = 9700.0; // 10k
+
+
+// OLED display configuration
+#define SCREEN_WIDTH 128
+#define SCREEN_HEIGHT 64
+#define OLED_RESET -1   // Reset pin not used with ESP32
+Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
 // WebServer
 WebServer server(80);
 
 ACState ac_state;
 bool updated = false;
+float temp, humidity;
 
 // ================================
 // SETUP
@@ -39,6 +49,21 @@ void setup() {
   TODO: server.on("/", HTTP_PUT,  handle_UpdateAcState);
   server.begin();
   Serial.println("Http server started");
+
+
+  // Initialize I2C with SDA=21 and SCL=22
+  Wire.begin(21, 22);
+  // Initialize the OLED display
+  if(!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println(F("SSD1306 allocation failed"));
+    while (1);
+  }
+
+  delay(2000);
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  display.setCursor(15, 0);
 }
 
 
@@ -46,12 +71,35 @@ void setup() {
 // LOOP
 // ================================
 
+
 void loop() {
   server.handleClient();
-  Serial.println("test");
   if (updated) generate_ir_signal();
-  delay(300);
+
+  calculateTemperature();
+
+  display.clearDisplay();
+  display.setTextSize(2);
+  display.setCursor(0, 3);
+  display.print("Temp:");
+
+  display.setCursor(30, 25);
+
+  // Display error message if the reading was invalid
+  if (temp == -1.0) {
+    display.print("Err");
+  } else {
+    display.print(temp, 1);
+    display.print("C");
+  }
+
+  display.display();
+  delay(10);
 }
+
+unsigned long sample_start = 0;
+uint32_t adc_sum = 0;
+uint32_t adc_samples = 0;
 
 // ================================
 // WIFI
@@ -89,6 +137,8 @@ void handle_GetAcState() {
   djb["display"] = ac_state.display;
   djb["swing"] = ac_state.swing;
   djb["super"] = ac_state.super;
+  djb["room_temp"] = temp;
+  djb["room_humidity"] = humidity;
   serializeJson(djb, output);
   server.send(200, "application/json" , output);
 }
@@ -168,4 +218,53 @@ void mark(uint32_t duration_us) {
 void space(uint32_t duration_us) {
     digitalWrite(EMISOR_PIN, LOW);
     delayMicroseconds(duration_us);
+}
+
+
+float calculateTemperature() {
+  int tempReading = 0;
+
+  for (int i = 0; i < 40; i++) {
+    int val = analogRead(THERM_PIN);
+    tempReading += constrain(val, 10, 4085);
+    delay(3);
+  }
+
+  tempReading /= 40;
+
+  float voltage = tempReading * 3.3 / 4095.0;
+  voltage *= 1.09;
+
+  float ntcResistance =
+      SERIES_RESISTOR * voltage / (3.3 - voltage);
+  ntcResistance *= 1.06;
+
+  if (ntcResistance <= 0) {
+    return -1.0;
+  }
+
+  const float BETA = 3220.0;
+  const float T0 = 25.0 + 273.15;
+  const float R0 = 9050.0;
+
+  float tempK =
+      1.0 /
+      (
+        (1.0 / T0) +
+        (1.0 / BETA) * log(ntcResistance / R0)
+      );
+
+  Serial.print("ADC: ");
+  Serial.println(tempReading);
+
+  Serial.print("Voltage: ");
+  Serial.println(voltage);
+
+  Serial.print("NTC resistance: ");
+  Serial.println(ntcResistance);
+
+  temp = tempK - 273.15;
+
+  Serial.print("Current Temp: ");
+  Serial.println(temp);
 }
