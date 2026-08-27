@@ -1,18 +1,14 @@
 #include <WiFi.h>
-#include <WebServer.h>
 #include <ArduinoJson.h>
 #include <Wire.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <MQTTClient.h>
 #include "src/ac_state.h"
 #include "src/secret.h"
 
 #define EMISOR_PIN 26
 #define THERM_PIN 35
-
-
-const float SERIES_RESISTOR = 9700.0; // 10k
-
 
 // OLED display configuration
 #define SCREEN_WIDTH 128
@@ -20,12 +16,12 @@ const float SERIES_RESISTOR = 9700.0; // 10k
 #define OLED_RESET -1   // Reset pin not used with ESP32
 Adafruit_SSD1306 display(SCREEN_WIDTH, SCREEN_HEIGHT, &Wire, OLED_RESET);
 
-// WebServer
-WebServer server(80);
-
 ACState ac_state;
-bool updated = false;
 float temp, humidity;
+
+
+WiFiClient network;
+MQTTClient mqtt = MQTTClient(1024);
 
 // ================================
 // SETUP
@@ -44,13 +40,6 @@ void setup() {
 
   connectWiFi();
 
-  server.onNotFound(handle_NotFound);
-  server.on("/", HTTP_GET,  handle_GetAcState);
-  TODO: server.on("/", HTTP_PUT,  handle_UpdateAcState);
-  server.begin();
-  Serial.println("Http server started");
-
-
   // Initialize I2C with SDA=21 and SCL=22
   Wire.begin(21, 22);
   // Initialize the OLED display
@@ -64,6 +53,8 @@ void setup() {
   display.setTextSize(1);
   display.setTextColor(WHITE);
   display.setCursor(15, 0);
+
+  connectToMQTT();
 }
 
 
@@ -73,10 +64,10 @@ void setup() {
 
 
 void loop() {
-  server.handleClient();
-  if (updated) generate_ir_signal();
+  mqtt.loop();
 
   calculateTemperature();
+  publish_room_temperature();
 
   display.clearDisplay();
   display.setTextSize(2);
@@ -94,12 +85,7 @@ void loop() {
   }
 
   display.display();
-  delay(10);
 }
-
-unsigned long sample_start = 0;
-uint32_t adc_sum = 0;
-uint32_t adc_samples = 0;
 
 // ================================
 // WIFI
@@ -124,60 +110,344 @@ void connectWiFi() {
 
 
 // ================================
-// Server
+// MQTT
 // ================================
 
-void handle_GetAcState() {
-  JsonDocument djb;
-  String output;
-  djb["power"] = ac_state.power;
-  djb["temp"] = ac_state.temp;
-  djb["healthy"] = ac_state.healthy;
-  djb["fan_mode"] = ac_state.fan_mode;
-  djb["display"] = ac_state.display;
-  djb["swing"] = ac_state.swing;
-  djb["super"] = ac_state.super;
-  djb["room_temp"] = temp;
-  djb["room_humidity"] = humidity;
-  serializeJson(djb, output);
-  server.send(200, "application/json" , output);
-}
+const char DISCOVERY_CLIMATE_TOPIC[] = "homeassistant/climate/ac_oficina/config";
+const char DISCOVERY_DISPLAY_SWITCH_TOPIC[] = "homeassistant/switch/ac_oficina_display/config";
+const char DISCOVERY_HEALTHY_SWITCH_TOPIC[] = "homeassistant/switch/ac_oficina_healthy/config";
+const char ROOM_TEMPERATURE_TOPIC[] = "ac/room_temperature";
+const char TEMPERATURE_STATE_TOPIC[] = "ac/temperature/state";
+const char TEMPERATURE_SET_TOPIC[] = "ac/temperature/set";
+const char MODE_STATE_TOPIC[] = "ac/mode/state";
+const char MODE_SET_TOPIC[] = "ac/mode/set";
+const char AVAILABILITY_TOPIC[] = "ac/availability";
+const char FAN_MODE_SET_TOPIC[] = "ac/fan_mode/set";
+const char FAN_MODE_STATE_TOPIC[] = "ac/fan_mode/state";
+const char PRESET_MODE_SET_TOPIC[] = "ac/preset_mode/set";
+const char PRESET_MODE_STATE_TOPIC[] = "ac/preset_mode/state";
+const char SWING_MODE_SET_TOPIC[] = "ac/swing_mode/set";
+const char SWING_MODE_STATE_TOPIC[] = "ac/swing_mode/state";
+const char HEALTHY_SET_TOPIC[] = "ac/healthy/set";
+const char HEALTHY_STATE_TOPIC[] = "ac/healthy/state";
+const char DISPLAY_SET_TOPIC[] = "ac/display/set";
+const char DISPLAY_STATE_TOPIC[] = "ac/display/state";
 
-void handle_UpdateAcState() {
-  JsonDocument req_json;
-  deserializeJson(req_json, server.arg("plain"));
-  // NOTE: order matters
-  if (req_json["temp"].is<uint8_t>()) {
-    set_temperature(&ac_state, req_json["temp"]);
-  }
-  if (req_json["fan_mode"].is<FanMode>()) {
-    set_fan_mode(&ac_state, req_json["fan_mode"]);
-  }
-  // NOTE: activate super mode will override temp and fan_mode values to (temp: 16, fan_mode: AUTO)
-  if (req_json["super"].is<bool>()) {
-    set_super(&ac_state, req_json["super"]);
-  }
-  if (req_json["healthy"].is<bool>()) {
-    set_healthy(&ac_state, req_json["healthy"]);
-  }
-  if (req_json["display"].is<bool>()) {
-    set_display(&ac_state, req_json["display"]);
-  }
-  if (req_json["swing"].is<bool>()) {
-    set_swing(&ac_state, req_json["swing"]);
-  }
-  if (req_json["power"].is<PowerMode>()) {
-    set_power(&ac_state, req_json["power"]);
+
+void connectToMQTT() {
+  // Connect to the MQTT broker
+  mqtt.begin(MQTT_BROKER_ADDR, MQTT_BROKER_PORT, network);
+
+  // Create a handler for incoming messages
+  mqtt.onMessage(messageHandler);
+
+  Serial.println("Connecting to MQTT broker");
+
+  mqtt.setWill(AVAILABILITY_TOPIC, "offline", true, 1);
+  while (!mqtt.connect(MQTT_CLIENT_ID)) {
+    Serial.print(".");
+    delay(100);
   }
 
-  Serial.printf("%v\n", ac_state);
-  updated = true;
-  server.send(200, "application/json" , "{}");
+  Serial.println();
+
+  if (!mqtt.connected()){
+    Serial.println("MQTT broker Timeout!");
+    return;
+  }
+
+  publish_discovery_climate();
+  publish_discovery_display_switch();
+  publish_discovery_healthy_switch();
+
+  // subscriptions
+  subscribe(TEMPERATURE_SET_TOPIC);
+  subscribe(MODE_SET_TOPIC);
+  subscribe(FAN_MODE_SET_TOPIC);
+  subscribe(PRESET_MODE_SET_TOPIC);
+  subscribe(SWING_MODE_SET_TOPIC);
+  subscribe(DISPLAY_SET_TOPIC);
+  subscribe(HEALTHY_SET_TOPIC);
+
+
+  publish_availability();
+  publish_mode_state();
+  publish_temperature_state();
+  publish_fan_mode_state();
+  publish_preset_mode_state();
+  publish_swing_state();
+  publish_display_state();
+  publish_healthy_state();
 }
 
-void handle_NotFound() {
-  server.send(404, "application/json" ,"{}");
+
+void publish_discovery_climate() {
+  StaticJsonDocument<2048> message;
+  message["name"] = "AC Oficina";
+  message["unique_id"] = "ac_oficina";
+  message["precision"] = "1.0";
+  message["min_temp"] = "16";
+  message["max_temp"] = "31";
+  JsonArray modes = message.createNestedArray("modes");
+  modes.add("off");
+  modes.add("cool");
+  JsonArray fan_modes = message.createNestedArray("fan_modes");
+  fan_modes.add("auto");
+  fan_modes.add("low");
+  fan_modes.add("medium");
+  fan_modes.add("high");
+  JsonArray presets = message.createNestedArray("preset_modes");
+  presets.add("Super");
+  JsonArray swing_modes = message.createNestedArray("swing_modes");
+  swing_modes.add("on");
+  swing_modes.add("off");
+  message["current_temperature_topic"] = ROOM_TEMPERATURE_TOPIC;
+  message["temperature_command_topic"] = TEMPERATURE_SET_TOPIC;
+  message["temperature_state_topic"] = TEMPERATURE_STATE_TOPIC;
+  message["mode_command_topic"] = MODE_SET_TOPIC;
+  message["mode_state_topic"] = MODE_STATE_TOPIC;
+  message["availability_topic"] = AVAILABILITY_TOPIC;
+  message["fan_mode_command_topic"] = FAN_MODE_SET_TOPIC;
+  message["fan_mode_state_topic"] = FAN_MODE_STATE_TOPIC;
+  message["preset_mode_command_topic"] = PRESET_MODE_SET_TOPIC;
+  message["preset_mode_state_topic"] = PRESET_MODE_STATE_TOPIC;
+  message["swing_mode_command_topic"] = SWING_MODE_SET_TOPIC;
+  message["swing_mode_state_topic"] = SWING_MODE_STATE_TOPIC;
+
+  JsonObject device = message.createNestedObject("device");
+  device["name"] = "AC Oficina";
+  device["manufacturer"] = "Custom";
+  device["model"] = "Royal IR Controller";
+  JsonArray identifiers = device.createNestedArray("identifiers");
+  identifiers.add("ac_oficina");
+
+
+  char messageBuffer[2048];
+  serializeJson(message, messageBuffer);
+  mqtt.publish(DISCOVERY_CLIMATE_TOPIC, messageBuffer, true, 0);
 }
+
+void publish_discovery_display_switch() {
+  StaticJsonDocument<512> message;
+  message["name"] = "Display";
+  message["unique_id"] = "ac_oficina_display";
+  message["payload_on"] = "ON";
+  message["payload_off"] = "OFF";
+  message["availability_topic"] = AVAILABILITY_TOPIC;
+  message["command_topic"] = DISPLAY_SET_TOPIC;
+  message["state_topic"] = DISPLAY_STATE_TOPIC;
+
+  JsonObject device = message.createNestedObject("device");
+  device["name"] = "AC Oficina";
+  device["manufacturer"] = "Custom";
+  device["model"] = "Royal IR Controller";
+  JsonArray identifiers = device.createNestedArray("identifiers");
+  identifiers.add("ac_oficina");
+
+  char messageBuffer[512];
+  serializeJson(message, messageBuffer);
+  mqtt.publish(DISCOVERY_DISPLAY_SWITCH_TOPIC, messageBuffer, true, 0);
+}
+
+void publish_discovery_healthy_switch() {
+  StaticJsonDocument<512> message;
+  message["name"] = "Healthy";
+  message["unique_id"] = "ac_oficina_healthy";
+  message["payload_on"] = "ON";
+  message["payload_off"] = "OFF";
+  message["availability_topic"] = AVAILABILITY_TOPIC;
+  message["command_topic"] = HEALTHY_SET_TOPIC;
+  message["state_topic"] = HEALTHY_STATE_TOPIC;
+
+  JsonObject device = message.createNestedObject("device");
+  device["name"] = "AC Oficina";
+  device["manufacturer"] = "Custom";
+  device["model"] = "Royal IR Controller";
+  JsonArray identifiers = device.createNestedArray("identifiers");
+  identifiers.add("ac_oficina");
+
+  char messageBuffer[512];
+  serializeJson(message, messageBuffer);
+  mqtt.publish(DISCOVERY_HEALTHY_SWITCH_TOPIC, messageBuffer, true, 0);
+}
+
+void subscribe(const char topic[]) {
+  // Subscribe to a topic, the incoming messages are processed by messageHandler() function
+  if (mqtt.subscribe(topic))
+    Serial.print("Subscribed to the topic: ");
+  else
+    Serial.print("Failed to subscribe to the topic: ");
+
+  Serial.println(topic);
+}
+
+void messageHandler(String &topic, String &payload) {
+  Serial.println("received from MQTT:");
+  Serial.println("- topic: " + topic);
+  Serial.println("- payload: " + payload);
+
+  if (topic == MODE_SET_TOPIC)
+    handle_mode_set(payload);
+  else if (topic == TEMPERATURE_SET_TOPIC)
+    handle_temperature_set(payload);
+  else if (topic == FAN_MODE_SET_TOPIC)
+    handle_fan_mode_set(payload);
+  else if (topic == PRESET_MODE_SET_TOPIC)
+    handle_preset_mode_set(payload);
+  else if (topic == SWING_MODE_SET_TOPIC)
+    handle_swing_set(payload);
+  else if (topic == DISPLAY_SET_TOPIC)
+    handle_display_set(payload);
+  else if (topic == HEALTHY_SET_TOPIC)
+    handle_healthy_set(payload);
+}
+
+void handle_mode_set(String &payload) {
+  bool updated = false;
+  if (payload == "off") {
+      set_power(&ac_state, POWER_TO_OFF);
+      updated = true;
+  } else if (payload == "cool") {
+      set_power(&ac_state, POWER_ON);
+      updated = true;
+  }
+
+  if (updated) {
+    publish_mode_state();
+    generate_ir_signal();
+  }
+}
+
+void handle_temperature_set(String &payload) {
+  set_temperature(&ac_state, payload.toInt());
+  publish_temperature_state();
+  publish_mode_state();
+  publish_preset_mode_state();
+  generate_ir_signal();
+}
+
+void handle_fan_mode_set(String &payload) {
+  Serial.println("Fan Mode: " + payload);
+  if (payload == "low")
+    set_fan_mode(&ac_state, FAN_LOW);
+  else if (payload == "medium")
+    set_fan_mode(&ac_state, FAN_MIDDLE);
+  else if (payload == "high")
+    set_fan_mode(&ac_state, FAN_HIGH);
+  else
+    set_fan_mode(&ac_state, FAN_AUTO);
+
+  Serial.println(ac_state.fan_mode);
+
+  publish_fan_mode_state();
+  publish_preset_mode_state();
+  generate_ir_signal();
+}
+
+void handle_preset_mode_set(String &payload) {
+  Serial.println("Preset Mode: " + payload);
+  set_super(&ac_state, payload == "Super");
+
+  publish_preset_mode_state();
+  publish_temperature_state();
+  publish_fan_mode_state();
+  generate_ir_signal();
+}
+
+void handle_swing_set(String &payload) {
+  set_swing(&ac_state, payload == "on");
+  publish_swing_state();
+  generate_ir_signal();
+}
+
+void handle_display_set(String &payload) {
+  set_display(&ac_state, payload == "ON");
+  publish_display_state();
+  generate_ir_signal();
+}
+
+void handle_healthy_set(String &payload) {
+  set_healthy(&ac_state, payload == "ON");
+  publish_healthy_state();
+  generate_ir_signal();
+}
+
+void publish_temperature_state() {
+  mqtt.publish(TEMPERATURE_STATE_TOPIC, String(ac_state.temp), true, 0);
+}
+
+void publish_fan_mode_state() {
+  switch (ac_state.fan_mode) {
+    case FAN_AUTO:
+      mqtt.publish(FAN_MODE_STATE_TOPIC, "auto", true, 0);
+      break;
+    case FAN_LOW:
+      mqtt.publish(FAN_MODE_STATE_TOPIC, "low", true, 0);
+      break;
+    case FAN_MIDDLE:
+      mqtt.publish(FAN_MODE_STATE_TOPIC, "medium", true, 0);
+      break;
+    case FAN_HIGH:
+      mqtt.publish(FAN_MODE_STATE_TOPIC, "high", true, 0);
+      break;
+  }
+}
+
+void publish_preset_mode_state() {
+  if (ac_state.super)
+    mqtt.publish(PRESET_MODE_STATE_TOPIC, "Super", true, 0);
+  else
+    mqtt.publish(PRESET_MODE_STATE_TOPIC, "None", true, 0);
+}
+
+void publish_mode_state() {
+  switch (ac_state.power) {
+    case POWER_TO_ON:
+      mqtt.publish(MODE_STATE_TOPIC, "cool", true, 0);
+      break;
+    case POWER_TO_OFF:
+      mqtt.publish(MODE_STATE_TOPIC, "off", true, 0);
+      break;
+    case POWER_ON:
+      mqtt.publish(MODE_STATE_TOPIC, "cool", true, 0);
+      break;
+  }
+}
+
+void publish_swing_state() {
+  if (ac_state.swing)
+      mqtt.publish(SWING_MODE_STATE_TOPIC, "on", true, 0);
+  else
+      mqtt.publish(SWING_MODE_STATE_TOPIC, "off", true, 0);
+}
+
+void publish_display_state() {
+  if (ac_state.display)
+      mqtt.publish(DISPLAY_STATE_TOPIC, "ON", true, 0);
+  else
+      mqtt.publish(DISPLAY_STATE_TOPIC, "OFF", true, 0);
+}
+
+void publish_healthy_state() {
+  if (ac_state.healthy)
+      mqtt.publish(HEALTHY_STATE_TOPIC, "ON", true, 0);
+  else
+      mqtt.publish(HEALTHY_STATE_TOPIC, "OFF", true, 0);
+}
+
+void publish_availability() {
+  mqtt.publish(AVAILABILITY_TOPIC, "online", true, 1);
+}
+
+void publish_room_temperature() {
+  static uint32_t last_published = 0;
+  if (millis() - last_published < 10000) return;
+
+  last_published = millis();
+
+  mqtt.publish(ROOM_TEMPERATURE_TOPIC, String(temp), true, 0);
+}
+
 
 void generate_ir_signal() {
   uint8_t* frame = build_frame(&ac_state);
@@ -200,7 +470,6 @@ void generate_ir_signal() {
   space(0);
 
   delete[] frame;
-  updated = false;
 }
 
 void mark(uint32_t duration_us) {
@@ -221,7 +490,7 @@ void space(uint32_t duration_us) {
 }
 
 
-float calculateTemperature() {
+void calculateTemperature() {
   int tempReading = 0;
 
   for (int i = 0; i < 40; i++) {
@@ -236,12 +505,10 @@ float calculateTemperature() {
   voltage *= 1.09;
 
   float ntcResistance =
-      SERIES_RESISTOR * voltage / (3.3 - voltage);
+      9700.0 * voltage / (3.3 - voltage);
   ntcResistance *= 1.06;
 
-  if (ntcResistance <= 0) {
-    return -1.0;
-  }
+  if (ntcResistance <= 0) return;
 
   const float BETA = 3220.0;
   const float T0 = 25.0 + 273.15;
@@ -254,17 +521,17 @@ float calculateTemperature() {
         (1.0 / BETA) * log(ntcResistance / R0)
       );
 
-  Serial.print("ADC: ");
-  Serial.println(tempReading);
+  // Serial.print("ADC: ");
+  // Serial.println(tempReading);
 
-  Serial.print("Voltage: ");
-  Serial.println(voltage);
+  // Serial.print("Voltage: ");
+  // Serial.println(voltage);
 
-  Serial.print("NTC resistance: ");
-  Serial.println(ntcResistance);
+  // Serial.print("NTC resistance: ");
+  // Serial.println(ntcResistance);
 
   temp = tempK - 273.15;
 
-  Serial.print("Current Temp: ");
-  Serial.println(temp);
+  // Serial.print("Current Temp: ");
+  // Serial.println(temp);
 }
